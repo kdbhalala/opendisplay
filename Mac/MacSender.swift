@@ -490,9 +490,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             guard let self, !self.stopped, self.stream == nil,
                   let hello = self.lastHello else { return }
             // Does our virtual display still exist? CGDisplayBounds returns a
-            // zero rect for an unknown id, so a non-zero bounds means it's live.
+            // zero rect for an unknown id, so a non-empty bounds means it's live.
+            // Test isEmpty, not isNull: isNull is only true for the special
+            // CGRect.null, so it reads as "live" for a dead display too and the
+            // rebuild fallback below would become unreachable.
             if let vd = self.virtualDisplay,
-               !CGDisplayBounds(vd.displayID).isNull {
+               !CGDisplayBounds(vd.displayID).isEmpty {
                 Log.info("capture died — display still present, re-attaching capture only (#29)")
                 Task {
                     do {
