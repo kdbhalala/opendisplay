@@ -449,12 +449,20 @@ final class SenderController: ObservableObject {
         })
         for s in sessions {
             guard case .wifi(let result) = s.target else { continue }
-            let duplicate = (s.deviceID.map { usbSessionIDs.contains($0) } ?? false)
-                || (txtID(of: result).map { usbSessionIDs.contains($0) } ?? false)
-                || (serviceName(of: result).map { cabledNames.contains($0) } ?? false)
-            if duplicate {
-                Log.info("two sessions for one device — keeping the cable, dropping \(s.id)")
-                end(s)
+            let matchingUSB = usbDevices.first { device in
+                sameDevice(result, device) && !usbDisabled.contains("usb:\(device.udid)")
+            }
+            if let matchingUSB, !s.onUSB {
+                Log.info("cable attached for duplicate session \(s.id) — migrating to USB")
+                upgradeToUSB(s, device: matchingUSB)
+            } else {
+                let duplicate = (s.deviceID.map { usbSessionIDs.contains($0) } ?? false)
+                    || (txtID(of: result).map { usbSessionIDs.contains($0) } ?? false)
+                    || (serviceName(of: result).map { cabledNames.contains($0) } ?? false)
+                if duplicate {
+                    Log.info("two sessions for one device — keeping the cable, dropping \(s.id)")
+                    end(s)
+                }
             }
         }
     }
