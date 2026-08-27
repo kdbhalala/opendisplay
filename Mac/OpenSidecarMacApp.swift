@@ -366,8 +366,6 @@ final class SenderController: ObservableObject {
     private func upgradeToUSB(_ session: DeviceSession, device: UsbmuxDevice) {
         guard !session.onUSB, let portNum = UInt16(port) else { return }
         Log.info("cable attached for \(session.id) — migrating to USB")
-        session.onUSB = true
-        session.usbUDID = device.udid
         // The match may have been by name only — pin the strong identity so
         // future matching (and the next launch) recognizes the pair.
         if let id = session.deviceID { installIDByUDID[device.udid] = id }
@@ -383,7 +381,6 @@ final class SenderController: ObservableObject {
             guard let udid = session.usbUDID, detachedUDIDs.contains(udid),
                   let result = wifiService(for: session) else { continue }
             Log.info("cable detached for \(session.id) — failing over to WiFi")
-            session.onUSB = false
             session.wifiServiceName = serviceName(of: result)
             session.sender.switchTransport(to: .tcp(result.endpoint))
         }
@@ -550,6 +547,16 @@ final class SenderController: ObservableObject {
             guard let session, session.status != text else { return }
             session.status = text
             Log.info("status[\(id)]: \(text)")
+        }
+        sender.onTransportConfirmed = { [weak session] transport in
+            guard let session else { return }
+            switch transport {
+            case .usb(let udid, _):
+                session.onUSB = true
+                if let udid { session.usbUDID = udid }
+            case .tcp:
+                session.onUSB = false
+            }
         }
         sender.onHello = { [weak self, weak session] info in
             guard let self, let session else { return }
