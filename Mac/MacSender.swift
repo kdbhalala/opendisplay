@@ -1375,6 +1375,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func setupEncoder(width: Int, height: Int) throws {
+        if let existing = encoder {
+            VTCompressionSessionInvalidate(existing)
+            encoder = nil
+        }
         // Low-latency rate control: the hardware encoder emits every frame
         // immediately instead of pipelining. (`-lowlatency NO` for A/B.)
         let lowLatency = UserDefaults.standard.object(forKey: "lowlatency") == nil
