@@ -755,7 +755,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // A retired stream commonly reports its stop after the replacement is
         // already live. It must not tear down that replacement (#203).
         guard stream === self.stream else { return }
-        Log.info("stream stopped with error: \(error)")
+        let errorDesc = (error as NSError).description
+        Log.info("stream stopped with error: \(errorDesc)")
         // The user stopped this capture from the system UI (the menu bar's
         // recording indicator / "Stop Extending"). That is a disconnect, not
         // a fault: restarting capture would defy the user — and macOS
@@ -767,7 +768,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             Task { @MainActor in self.onCaptureStoppedByUser?() }
             return
         }
-        Task { await status("Capture stopped: \(error.localizedDescription)") }
+        let locDesc = error.localizedDescription
+        Task { await status("Capture stopped: \(locDesc)") }
         // E.g. display sleep can tear the virtual display down underneath the
         // stream — rebuild instead of sitting dead until an app restart.
         guard !stopped, mode == .extend else { return }
