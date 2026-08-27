@@ -258,6 +258,7 @@ final class SenderController: ObservableObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.discovered = Array(results)
+                self.failoverPendingSessions()
                 self.endSessionsWhoseServiceVanished()
                 self.autoConnect()
             }
@@ -381,6 +382,20 @@ final class SenderController: ObservableObject {
             guard let udid = session.usbUDID, detachedUDIDs.contains(udid),
                   let result = wifiService(for: session) else { continue }
             Log.info("cable detached for \(session.id) — failing over to WiFi")
+            session.wifiServiceName = serviceName(of: result)
+            session.sender.switchTransport(to: .tcp(result.endpoint))
+        }
+    }
+
+    /// Re-evaluates USB sessions whose cable was disconnected during their
+    /// grace period when their WiFi Bonjour service becomes visible.
+    private func failoverPendingSessions() {
+        guard autoConnectEnabled else { return }
+        let attachedUDIDs = Set(usbDevices.map(\.udid))
+        for session in sessions where session.onUSB {
+            guard let udid = session.usbUDID, !attachedUDIDs.contains(udid),
+                  let result = wifiService(for: session) else { continue }
+            Log.info("WiFi service appeared for detached cabled session \(session.id) — failing over to WiFi")
             session.wifiServiceName = serviceName(of: result)
             session.sender.switchTransport(to: .tcp(result.endpoint))
         }
