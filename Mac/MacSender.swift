@@ -236,6 +236,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var cursorImageTimer: DispatchSourceTimer?
     private var lastCursorSent: (x: Double, y: Double, visible: Bool) = (-1, -1, false)
     private var lastCursorPNGHash = 0
+    private var lastCursorObject: (cursor: NSCursor, hotSpot: NSPoint, displayWidth: CGFloat)?
     private var captureDisplayID: CGDirectDisplayID = 0
     // ScreenCaptureKit and VideoToolbox finish work asynchronously. During a
     // rotation, an old capture callback or a late encoder completion must not
@@ -638,6 +639,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         captureDisplayID = display.displayID
         lastCursorPNGHash = 0      // rotation rebuilds: re-send the sprite
+        lastCursorObject = nil
         lastCursorSent = (-1, -1, false)
         startCursorEcho()
         // A capture that came back through any path (recovery, rotation,
@@ -887,6 +889,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // changes it. Reset the dedup state to re-send sprite + position to
         // the fresh peer — the cursor analogue of forcing a keyframe.
         lastCursorPNGHash = 0
+        lastCursorObject = nil
         lastCursorSent = (-1, -1, false)
         lastReceived = Date()  // fresh grace period for the watchdog
         receiveControl(on: conn)
@@ -1154,14 +1157,24 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
               let cursor = NSCursor.currentSystem else { return }
         let displaySize = CGDisplayBounds(captureDisplayID).size   // points, current mode
         guard displaySize.width > 0, displaySize.height > 0 else { return }
+        if let last = lastCursorObject,
+           last.cursor === cursor,
+           last.hotSpot == cursor.hotSpot,
+           last.displayWidth == displaySize.width {
+            return
+        }
         let image = cursor.image
         guard let tiff = image.tiffRepresentation else { return }
         let hash = tiff.hashValue ^ Int(displaySize.width) &* 31
-        guard hash != lastCursorPNGHash else { return }
+        guard hash != lastCursorPNGHash else {
+            lastCursorObject = (cursor, cursor.hotSpot, displaySize.width)
+            return
+        }
         guard let rep = NSBitmapImageRep(data: tiff),
               let png = rep.representation(using: .png, properties: [:]),
               png.count < 24_000 else { return }
         lastCursorPNGHash = hash
+        lastCursorObject = (cursor, cursor.hotSpot, displaySize.width)
         let size = image.size            // Mac points
         let hot = cursor.hotSpot
         // Normalized against the display so the phone can size/anchor the
