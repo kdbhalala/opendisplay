@@ -79,6 +79,7 @@ struct PhoneInfo: Decodable {
                           // (PROTOCOL.md 6.4); probed for a cable upgrade
     let maxEncodeWide: Int?  // receiver's decode ceiling in pixels (PROTOCOL.md
     let maxEncodeHigh: Int?  //  6.5): cap the stream, keep the desktop size
+    let codecs: [String]? // supported video codecs, e.g. ["h264", "hevc"] (issue #10)
 
     var kind: String { device ?? "device" }
     var protocolVersion: Int { pv ?? WireProtocol.assumedWhenAbsent }
@@ -1850,14 +1851,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Create the compression session into `encoder`, optionally requiring an
     /// encoder that supports low-latency rate control.
-    private func createCompressionSession(width: Int, height: Int, lowLatency: Bool) -> OSStatus {
+    private func createCompressionSession(width: Int, height: Int, codecType: CMVideoCodecType, lowLatency: Bool) -> OSStatus {
         let spec: CFDictionary? = lowLatency
             ? [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: kCFBooleanTrue] as CFDictionary
             : nil
         return VTCompressionSessionCreate(
             allocator: nil,
             width: Int32(width), height: Int32(height),
-            codecType: kCMVideoCodecType_H264,
+            codecType: codecType,
             encoderSpecification: spec,
             imageBufferAttributes: nil,
             compressedDataAllocator: nil,
@@ -1872,22 +1873,19 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // immediately instead of pipelining. (`-lowlatency NO` for A/B.)
         let lowLatency = UserDefaults.standard.object(forKey: "lowlatency") == nil
             || UserDefaults.standard.bool(forKey: "lowlatency")
-        // The spec filters which encoder VideoToolbox is allowed to pick, so an
-        // unsupported key fails creation outright rather than being ignored the
-        // way the properties below are: this key *requires* an encoder that
-        // offers the mode, and Macs whose only encoder is AMD have none (#133).
-        // Retrying without it is close to free — the guarantees the mode makes
-        // (infinite GOP, no reordering, High profile) are all set explicitly
-        // below, and the default rate controller only pipelines when it is fed
-        // faster than real time, which the pendingEncodes backpressure already
-        // prevents. Measured on Apple silicon at a paced 60fps: 5.3ms mean
-        // submit→emit without the spec vs 6.1ms with it, 1 frame held either
-        // way. (Overfeeding it at ~320fps does queue ~8 frames, hence the cap.)
-        var status = createCompressionSession(width: width, height: height, lowLatency: lowLatency)
+        let preferHEVC = UserDefaults.standard.bool(forKey: "hevc")
+            || (lastHello?.codecs?.contains("hevc") ?? false)
+        var requestedCodec = preferHEVC ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264
+        var status = createCompressionSession(width: width, height: height, codecType: requestedCodec, lowLatency: lowLatency)
         var usedFallback = false
+        if encoder == nil, requestedCodec == kCMVideoCodecType_HEVC {
+            Log.info("HEVC encoder unavailable (status \(status)) — falling back to H.264")
+            requestedCodec = kCMVideoCodecType_H264
+            status = createCompressionSession(width: width, height: height, codecType: requestedCodec, lowLatency: lowLatency)
+        }
         if encoder == nil, lowLatency {
             Log.info("VTCompressionSessionCreate failed with low-latency rate control (status \(status)) — retrying without an encoder specification")
-            status = createCompressionSession(width: width, height: height, lowLatency: false)
+            status = createCompressionSession(width: width, height: height, codecType: requestedCodec, lowLatency: false)
             usedFallback = true
         }
         guard let encoder else {
@@ -1903,7 +1901,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // Low-latency settings: real-time, no B-frames, periodic keyframes.
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-        VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
+        if requestedCodec == kCMVideoCodecType_H264 {
+            VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
+        }
         // No periodic IDRs: each one is a bitrate spike → transmit-time hiccup.
         // TCP never loses data, and we force a keyframe on reconnect/drop.
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 3600 as CFNumber)
@@ -1913,7 +1913,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 60 as CFNumber)
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
         VTCompressionSessionPrepareToEncodeFrames(encoder)
-        Log.info("encoder ready: \(width)x\(height) H.264 \(quality.bitrate / 1_000_000)Mbps quality=\(quality.rawValue) lowLatencyRC=\(lowLatency && !usedFallback)\(usedFallback ? " (fallback)" : "")")
+        let codecName = requestedCodec == kCMVideoCodecType_HEVC ? "HEVC (H.265)" : "H.264"
+        Log.info("encoder ready: \(width)x\(height) \(codecName) \(quality.bitrate / 1_000_000)Mbps quality=\(quality.rawValue) lowLatencyRC=\(lowLatency && !usedFallback)\(usedFallback ? " (fallback)" : "")")
     }
 
     // MARK: - Capture callback
@@ -2159,19 +2160,41 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 dataPointerOut: &ptr) == noErr, let ptr else { return nil }
 
         var out = Data(capacity: total + 128)
-        // On keyframes, prepend SPS/PPS (they live in the format description).
+        // On keyframes, prepend parameter sets (VPS/SPS/PPS for HEVC, SPS/PPS for H.264).
         if isKeyframe(sample), let fmt = CMSampleBufferGetFormatDescription(sample) {
-            for i in 0..<2 {           // index 0 = SPS, 1 = PPS
-                var psPtr: UnsafePointer<UInt8>?
-                var psLen = 0
-                if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-                        fmt, parameterSetIndex: i,
-                        parameterSetPointerOut: &psPtr,
-                        parameterSetSizeOut: &psLen,
-                        parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil) == noErr,
-                   let psPtr {
-                    out.append(contentsOf: startCode)
-                    out.append(Data(bytes: psPtr, count: psLen))
+            let codec = CMFormatDescriptionGetMediaSubType(fmt)
+            if codec == kCMVideoCodecType_HEVC {
+                var count = 0
+                if CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                    fmt, parameterSetIndex: 0,
+                    parameterSetPointerOut: nil, parameterSetSizeOut: nil,
+                    parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil) == noErr {
+                    for i in 0..<count {
+                        var psPtr: UnsafePointer<UInt8>?
+                        var psLen = 0
+                        if CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                            fmt, parameterSetIndex: i,
+                            parameterSetPointerOut: &psPtr, parameterSetSizeOut: &psLen,
+                            parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil) == noErr,
+                           let psPtr {
+                            out.append(contentsOf: startCode)
+                            out.append(Data(bytes: psPtr, count: psLen))
+                        }
+                    }
+                }
+            } else {
+                for i in 0..<2 {           // index 0 = SPS, 1 = PPS
+                    var psPtr: UnsafePointer<UInt8>?
+                    var psLen = 0
+                    if CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                            fmt, parameterSetIndex: i,
+                            parameterSetPointerOut: &psPtr,
+                            parameterSetSizeOut: &psLen,
+                            parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil) == noErr,
+                       let psPtr {
+                        out.append(contentsOf: startCode)
+                        out.append(Data(bytes: psPtr, count: psLen))
+                    }
                 }
             }
         }
