@@ -2490,6 +2490,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func setupEncoder(_ configuration: VideoStreamConfiguration) throws {
+        if let existing = encoder {
+            VTCompressionSessionInvalidate(existing)
+            encoder = nil
+        }
         #if DEBUG
         if configuration.codec == VideoStreamConfiguration.hevcCodec,
            UserDefaults.standard.bool(forKey: "failHEVCSession") {   // late-fallback test knob
