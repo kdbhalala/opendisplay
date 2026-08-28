@@ -63,14 +63,49 @@ final class InputInjectorTests: XCTestCase {
         XCTAssertTrue(result.contains(.maskCommand))
     }
 
-    func testKeyInjectionSmoke() {
+    func testModifierFlagForVirtualKey() {
+        XCTAssertEqual(InputInjector.modifierFlag(for: 0x38), .maskShift)   // L-Shift
+        XCTAssertEqual(InputInjector.modifierFlag(for: 0x3C), .maskShift)   // R-Shift
+        XCTAssertEqual(InputInjector.modifierFlag(for: 0x3B), .maskControl)
+        XCTAssertEqual(InputInjector.modifierFlag(for: 0x3A), .maskAlternate)
+        XCTAssertEqual(InputInjector.modifierFlag(for: 0x37), .maskCommand)
+        XCTAssertNil(InputInjector.modifierFlag(for: 0x00)) // A
+        XCTAssertNil(InputInjector.modifierFlag(for: 0x35)) // Escape
+    }
+
+    func testModifierKeyUpClearsFlagEvenIfUIKitStillReportsIt() {
+        // Simulate UIKit leaving the modifier bit set on key-up of Command.
+        let cmdRaw: UInt = 1 << 20
+        var flags = InputInjector.eventFlags(for: cmdRaw)
+        if let modFlag = InputInjector.modifierFlag(for: 0x37) {
+            flags.remove(modFlag)
+        }
+        XCTAssertFalse(flags.contains(.maskCommand))
+    }
+
+    func testKeyInjectionUsesVirtualKeyNotIPadCharacters() {
         let injector = InputInjector(displayID: CGMainDisplayID())
+        // iPad may send English "a" / "UIKeyInputEscape"; Mac must ignore and
+        // use the virtual key so the active input source applies.
         injector.handleKey(hidUsage: 0x04, down: true, rawModifiers: 0, characters: "a")
         injector.handleKey(hidUsage: 0x04, down: false, rawModifiers: 0, characters: "a")
+        injector.handleKey(hidUsage: 0x29, down: true, rawModifiers: 0, characters: "UIKeyInputEscape")
+        injector.handleKey(hidUsage: 0x29, down: false, rawModifiers: 0, characters: "UIKeyInputEscape")
+
+        // Backspace hold → key-repeat path (timer starts; release cancels it).
+        injector.handleKey(hidUsage: 0x2A, down: true, rawModifiers: 0, characters: nil)
+        injector.handleKey(hidUsage: 0x2A, down: false, rawModifiers: 0, characters: nil)
 
         injector.setStickyModifiers(1 << 20) // Command
         injector.handleKey(hidUsage: 0x06, down: true, rawModifiers: 0, characters: "c")
         injector.handleKey(hidUsage: 0x06, down: false, rawModifiers: 0, characters: "c")
+
+        // Cmd+Space (input source / Spotlight on Mac).
+        injector.handleKey(hidUsage: 0x2C, down: true, rawModifiers: 1 << 20, characters: nil)
+        injector.handleKey(hidUsage: 0x2C, down: false, rawModifiers: 1 << 20, characters: nil)
+
+        injector.handleKey(hidUsage: 0xE3, down: true, rawModifiers: 1 << 20, characters: nil)
+        injector.releaseAllKeys()
     }
 
     func testTiltMathVector() {

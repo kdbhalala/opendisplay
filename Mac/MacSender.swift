@@ -653,6 +653,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stop() {
         stopped = true
+        inputInjector?.releaseAllKeys()
         invalidateCapturePipeline(discardingLastFrame: true)
         cursorTimer?.cancel()
         cursorTimer = nil
@@ -1298,6 +1299,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 let char = obj["char"] as? String
                 inputInjector?.handleKey(hidUsage: UInt16(code), down: down, rawModifiers: mod, characters: char)
             }
+        case "keysUp":
+            // Phone lost first-responder / cancelled an in-flight chord —
+            // release anything still held so modifiers cannot stick.
+            inputInjector?.releaseAllKeys()
         case "modSidebar":
             if let flags = obj["flags"] as? UInt {
                 inputInjector?.setStickyModifiers(flags)

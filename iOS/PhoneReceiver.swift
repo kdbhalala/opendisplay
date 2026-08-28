@@ -554,6 +554,11 @@ final class PhoneReceiver: ObservableObject {
         sendControl(["type": "modSidebar", "flags": flags])
     }
 
+    /// Ask the Mac to release any keys still held (focus loss / cancelled presses).
+    func sendKeysUp() {
+        sendControl(["type": "keysUp"])
+    }
+
     private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil,
                              completion: (() -> Void)? = nil) {
         guard let conn = conn ?? connection,

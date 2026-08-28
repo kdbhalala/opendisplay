@@ -42,6 +42,16 @@ final class InputInjector {
     private let capabilityMask: Int64 = 0x05C7       // pressure + tilt + rotation + buttons
     private var inRange = false
     private var stickyModifiers: CGEventFlags = []
+    private let stickyLock = NSLock()
+    /// Virtual keys we've posted as down without a matching up. Flushed when
+    /// the phone reports focus loss or the session ends.
+    private var keysDown: Set<CGKeyCode> = []
+    /// Synthetic key-repeat: UIKit only delivers press began/ended, so we
+    /// mirror macOS InitialKeyRepeat / KeyRepeat while a non-modifier is held.
+    private var repeatTimer: DispatchSourceTimer?
+    private var repeatVK: CGKeyCode?
+    private var repeatFlags: CGEventFlags = []
+    private let repeatQueue = DispatchQueue(label: "sh.peet.opensidecar.keyrepeat")
 
     // Pencil-only synthetic click counting — tablet events don't get click
     // state from the Window Server, so we mirror macOS double-click prefs here.
@@ -65,29 +75,142 @@ final class InputInjector {
 
     /// Sets sticky modifier flags sent from on-screen modifier sidebar (issue #7).
     func setStickyModifiers(_ rawFlags: UInt) {
-        stickyModifiers = Self.eventFlags(for: rawFlags)
+        let flags = Self.eventFlags(for: rawFlags)
+        stickyLock.lock()
+        stickyModifiers = flags
+        stickyLock.unlock()
+    }
+
+    private func currentStickyModifiers() -> CGEventFlags {
+        stickyLock.lock()
+        defer { stickyLock.unlock() }
+        return stickyModifiers
     }
 
     /// Injects keyboard key down/up events from connected hardware keyboards (issue #6).
+    ///
+    /// Character generation is left to macOS: we post virtual keycodes only so
+    /// the active input source (language / layout) applies. Attaching iPad
+    /// `UIKey.characters` as a unicode string forced the iPad's layout (usually
+    /// English) and bypassed the Mac input method.
     func handleKey(hidUsage: UInt16, down: Bool, rawModifiers: UInt = 0, characters: String? = nil) {
+        _ = characters  // wire may still send chars; ignored so Mac layout wins
+        repeatQueue.async { [weak self] in
+            self?.handleKeyLocked(hidUsage: hidUsage, down: down, rawModifiers: rawModifiers)
+        }
+    }
+
+    /// Posts key-up for every still-held key. Used when the phone loses focus
+    /// or the session ends without matching end events.
+    func releaseAllKeys() {
+        repeatQueue.sync { [weak self] in
+            self?.releaseAllKeysLocked()
+        }
+    }
+
+    private func handleKeyLocked(hidUsage: UInt16, down: Bool, rawModifiers: UInt) {
         guard let vk = Self.macKeyCode(for: hidUsage) else { return }
-        guard let event = CGEvent(keyboardEventSource: source, virtualKey: vk, keyDown: down) else { return }
-        var flags = Self.eventFlags(for: rawModifiers, sticky: stickyModifiers)
+        var flags = Self.eventFlags(for: rawModifiers, sticky: currentStickyModifiers())
+        // UIKit often still reports a modifier in modifierFlags on that
+        // modifier's key-up. A key-up that keeps the flag set leaves the OS
+        // believing the key is held — and pressing it again does not help.
+        if let modFlag = Self.modifierFlag(for: vk) {
+            if down { flags.insert(modFlag) }
+            else { flags.remove(modFlag) }
+        }
         if down {
-            switch vk {
-            case 0x38, 0x3C: flags.insert(.maskShift)
-            case 0x3B, 0x3E: flags.insert(.maskControl)
-            case 0x3A, 0x3D: flags.insert(.maskAlternate)
-            case 0x37, 0x36: flags.insert(.maskCommand)
-            default: break
+            keysDown.insert(vk)
+            postKey(vk: vk, down: true, flags: flags, isRepeat: false)
+            if Self.modifierFlag(for: vk) == nil {
+                startKeyRepeat(vk: vk, flags: flags)
+            } else {
+                updateKeyRepeatFlags(flags)
             }
+        } else {
+            keysDown.remove(vk)
+            stopKeyRepeat(for: vk)
+            postKey(vk: vk, down: false, flags: flags, isRepeat: false)
+            updateKeyRepeatFlags(flags)
         }
+    }
+
+    private func releaseAllKeysLocked() {
+        stopKeyRepeat()
+        let pending = keysDown
+        keysDown.removeAll()
+        for vk in pending {
+            var flags = currentStickyModifiers()
+            if let modFlag = Self.modifierFlag(for: vk) {
+                flags.remove(modFlag)
+            }
+            postKey(vk: vk, down: false, flags: flags, isRepeat: false)
+        }
+    }
+
+    private func postKey(vk: CGKeyCode, down: Bool, flags: CGEventFlags, isRepeat: Bool) {
+        if isRepeat, down,
+           let nsEvent = NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: NSEvent.ModifierFlags(rawValue: UInt(flags.rawValue)),
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: 0,
+            context: nil,
+            characters: "",
+            charactersIgnoringModifiers: "",
+            isARepeat: true,
+            keyCode: vk
+           ),
+           let event = nsEvent.cgEvent {
+            event.flags = flags
+            event.post(tap: .cghidEventTap)
+            return
+        }
+        guard let event = CGEvent(keyboardEventSource: source, virtualKey: vk, keyDown: down) else { return }
         event.flags = flags
-        if let chars = characters, !chars.isEmpty, down {
-            let utf16 = Array(chars.utf16)
-            event.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
-        }
         event.post(tap: .cghidEventTap)
+    }
+
+    private func startKeyRepeat(vk: CGKeyCode, flags: CGEventFlags) {
+        stopKeyRepeat()
+        repeatVK = vk
+        repeatFlags = flags
+        let delay = NSEvent.keyRepeatDelay
+        let interval = NSEvent.keyRepeatInterval
+        let timer = DispatchSource.makeTimerSource(queue: repeatQueue)
+        timer.schedule(deadline: .now() + delay, repeating: interval)
+        timer.setEventHandler { [weak self] in
+            guard let self, let vk = self.repeatVK else { return }
+            self.postKey(vk: vk, down: true, flags: self.repeatFlags, isRepeat: true)
+        }
+        timer.resume()
+        repeatTimer = timer
+    }
+
+    private func stopKeyRepeat(for vk: CGKeyCode? = nil) {
+        if let vk, repeatVK != vk { return }
+        repeatTimer?.cancel()
+        repeatTimer = nil
+        repeatVK = nil
+        repeatFlags = []
+    }
+
+    private func updateKeyRepeatFlags(_ flags: CGEventFlags) {
+        guard repeatVK != nil else { return }
+        // Drop the flag of whichever key is repeating from modifier-only state
+        // when a modifier is released; keep chord modifiers that are still down.
+        repeatFlags = flags
+    }
+
+    /// Modifier flag owned by a given mac virtual keycode, if any.
+    static func modifierFlag(for vk: CGKeyCode) -> CGEventFlags? {
+        switch vk {
+        case 0x38, 0x3C: return .maskShift
+        case 0x3B, 0x3E: return .maskControl
+        case 0x3A, 0x3D: return .maskAlternate
+        case 0x37, 0x36: return .maskCommand
+        default: return nil
+        }
     }
 
     static func ensureAccessibilityPermission() -> Bool {
@@ -138,8 +261,8 @@ final class InputInjector {
         guard let event = CGEvent(mouseEventSource: source, mouseType: type,
                                   mouseCursorPosition: point, mouseButton: .left) else { return }
         event.setIntegerValueField(.mouseEventClickState, value: Int64(clickState))
-        if !stickyModifiers.isEmpty {
-            event.flags.insert(stickyModifiers)
+        if case let sticky = currentStickyModifiers(), !sticky.isEmpty {
+            event.flags.insert(sticky)
         }
         event.post(tap: .cghidEventTap)
     }
