@@ -494,6 +494,9 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
+    /// When true, Mac cursor tracks the iPad pointer on hover. When false, it
+    /// only jumps on click/drag (and scroll lands under the Mac cursor).
+    @AppStorage("pointerFollowsHover") private var pointerFollowsHover = true
 
     private var version: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
@@ -523,6 +526,17 @@ struct SettingsView: View {
                     Text("Name")
                 } footer: {
                     Text("Shown in the Mac app's WiFi connection menu. iOS hides this \(deviceKind)'s real name from apps, so set it here once.")
+                }
+
+                Section {
+                    Picker("Trackpad cursor", selection: $pointerFollowsHover) {
+                        Text("Follow iPad pointer").tag(true)
+                        Text("Move on click only").tag(false)
+                    }
+                } header: {
+                    Text("Input")
+                } footer: {
+                    Text("Follow moves the Mac cursor with the iPad pointer. Move on click only leaves it still until you click or drag — useful if the mirrored Mac cursor fights the iPad pointer.")
                 }
 
                 Section {
@@ -565,7 +579,7 @@ struct SettingsView: View {
                           systemImage: "wifi")
                     Label("Rotate the \(deviceKind) for a vertical second monitor.",
                           systemImage: "rectangle.portrait.rotate")
-                    Label("Touch: tap to click, drag to drag, two-finger pan to scroll.",
+                    Label("Touch or trackpad: click/drag to click/drag, two-finger scroll to scroll.",
                           systemImage: "hand.tap")
                 } header: {
                     Text("How to connect")
@@ -793,6 +807,19 @@ struct VideoLayerView: UIViewRepresentable {
         pan.maximumNumberOfTouches = 2
         view.addGestureRecognizer(pan)
 
+        // Trackpad / mouse wheel scroll (EventType.scroll). Empty allowedTouchTypes
+        // keeps this off finger pans — those stay on the two-finger recognizer above.
+        let trackpadScroll = UIPanGestureRecognizer(target: view,
+                                                    action: #selector(VideoView.didTrackpadScroll(_:)))
+        trackpadScroll.allowedScrollTypesMask = .all
+        trackpadScroll.allowedTouchTypes = []
+        view.addGestureRecognizer(trackpadScroll)
+
+        // Magic Keyboard / mouse pointer motion → Mac mouseMoved.
+        let pointerHover = UIHoverGestureRecognizer(target: view,
+                                                    action: #selector(VideoView.didPointerHover(_:)))
+        view.addGestureRecognizer(pointerHover)
+
         // Local cursor echo: position updates ride the ~2ms control path
         // instead of the ~30ms video path, so the pointer feels native.
         receiver.onCursor = { [weak view] x, y, visible in
@@ -925,6 +952,7 @@ struct VideoLayerView: UIViewRepresentable {
         private var twoFingerActive = false
         private var lastPan = CGPoint.zero
         private var lastNorm: (x: Double, y: Double) = (0.5, 0.5)
+        private var lastTrackpadScroll = CGPoint.zero
 
         @objc func didTwoFingerPan(_ recognizer: UIPanGestureRecognizer) {
             guard let video = receiver?.videoSize, video != .zero else { return }
@@ -952,6 +980,55 @@ struct VideoLayerView: UIViewRepresentable {
             default:
                 twoFingerActive = false
             }
+        }
+
+        /// Magic Keyboard / mouse wheel scroll via EventType.scroll.
+        @objc func didTrackpadScroll(_ recognizer: UIPanGestureRecognizer) {
+            guard let video = receiver?.videoSize, video != .zero else { return }
+            switch recognizer.state {
+            case .began:
+                lastTrackpadScroll = .zero
+                // Only reposition the Mac cursor under the iPad pointer when
+                // follow-hover is on; click-only mode scrolls wherever the
+                // Mac cursor already sits.
+                if Self.pointerFollowsHover,
+                   let n = normalized(recognizer.location(in: self)) {
+                    lastNorm = n
+                    receiver?.sendTouch(phase: "moved", x: n.x, y: n.y)
+                }
+            case .changed:
+                let t = recognizer.translation(in: self)
+                let scale = min(bounds.width / video.width, bounds.height / video.height)
+                receiver?.sendScroll(dx: (t.x - lastTrackpadScroll.x) / scale,
+                                     dy: (t.y - lastTrackpadScroll.y) / scale)
+                lastTrackpadScroll = t
+            default:
+                break
+            }
+        }
+
+        /// Pointer motion (trackpad / mouse) without a click → Mac mouseMoved.
+        @objc func didPointerHover(_ recognizer: UIHoverGestureRecognizer) {
+            // Pencil hover is owned by InputCaptureEngine.
+            guard !inputEngine.isPencilHovering else { return }
+            if !isFirstResponder { becomeFirstResponder() }
+            guard Self.pointerFollowsHover else { return }
+            switch recognizer.state {
+            case .began, .changed:
+                guard let n = normalized(recognizer.location(in: self)) else { return }
+                lastNorm = n
+                // Don't move the Mac cursor while a click-drag is in progress —
+                // touchesMoved already owns that path.
+                guard !downSent, pendingDown == nil else { return }
+                receiver?.sendTouch(phase: "moved", x: n.x, y: n.y)
+            default:
+                break
+            }
+        }
+
+        /// Defaults to follow-hover when the key has never been set.
+        private static var pointerFollowsHover: Bool {
+            (UserDefaults.standard.object(forKey: "pointerFollowsHover") as? Bool) ?? true
         }
 
         // A press is only a click once we know a second finger is not coming.
@@ -1013,6 +1090,13 @@ struct VideoLayerView: UIViewRepresentable {
                 pendingDown = norm
                 pendingDownPoint = location
                 downSent = false
+                // Trackpad/mouse clicks have no second-finger ambiguity — the
+                // hold delay only exists so a two-finger finger-scroll doesn't
+                // fire a click. Commit immediately for pointing devices.
+                if touch.type == .indirectPointer {
+                    commitPendingDown()
+                    return
+                }
                 let work = DispatchWorkItem { [weak self] in self?.commitPendingDown() }
                 holdTimer = work
                 DispatchQueue.main.asyncAfter(deadline: .now() + holdDelay, execute: work)
@@ -1104,6 +1188,95 @@ struct VideoLayerView: UIViewRepresentable {
 
         override var canBecomeFirstResponder: Bool { true }
 
+        /// HID usages with a down event and no matching up yet.
+        private var keysDown: Set<Int> = []
+        /// Recently handled via UIKeyCommand (system-shortcut steal); skip a
+        /// duplicate pressesBegan/Ended for the same HID usage.
+        private var keyCommandHandled: [Int: CFAbsoluteTime] = [:]
+
+        /// Claim iPadOS system shortcuts (Spotlight Cmd+Space, etc.) so they
+        /// tunnel to the Mac instead of being handled locally.
+        override var keyCommands: [UIKeyCommand]? {
+            let chords: [(String, UIKeyModifierFlags)] = [
+                (" ", .command),
+                (" ", [.command, .shift]),
+                (" ", .control),
+                (" ", [.control, .shift]),
+                (" ", [.command, .control]),
+            ]
+            return chords.map { input, mods in
+                let cmd = UIKeyCommand(input: input, modifierFlags: mods,
+                                       action: #selector(handleClaimedKeyCommand(_:)))
+                cmd.wantsPriorityOverSystemBehavior = true
+                cmd.discoverabilityTitle = nil
+                return cmd
+            }
+        }
+
+        @objc private func handleClaimedKeyCommand(_ sender: UIKeyCommand) {
+            guard let input = sender.input,
+                  let hid = Self.hidUsage(forKeyCommandInput: input) else { return }
+            let code = Int(hid)
+            let now = CFAbsoluteTimeGetCurrent()
+            keyCommandHandled[code] = now
+            let mod = UInt(sender.modifierFlags.rawValue)
+            // Shortcut chords are discrete: synthesize down+up. pressesEnded
+            // may not arrive for system-priority key commands.
+            if !keysDown.contains(code) {
+                keysDown.insert(code)
+                receiver?.sendKey(code: code, down: true, mod: mod, char: nil)
+            }
+            keysDown.remove(code)
+            receiver?.sendKey(code: code, down: false, mod: mod, char: nil)
+        }
+
+        /// Map UIKeyCommand.input strings we claim to HID keyboard usages.
+        private static func hidUsage(forKeyCommandInput input: String) -> UInt16? {
+            switch input {
+            case " ": return 0x2C  // Space
+            case "\t": return 0x2B
+            case "\r", "\n": return 0x28
+            case UIKeyCommand.inputEscape: return 0x29
+            default:
+                guard input.count == 1, let scalar = input.unicodeScalars.first else { return nil }
+                let v = scalar.value
+                // a-z → HID 0x04…0x1D (US usage positions)
+                if v >= 97 && v <= 122 { return UInt16(v - 97 + 0x04) }
+                if v >= 65 && v <= 90 { return UInt16(v - 65 + 0x04) }
+                return nil
+            }
+        }
+
+        private func recentlyHandledByKeyCommand(_ code: Int) -> Bool {
+            guard let t = keyCommandHandled[code] else { return false }
+            if CFAbsoluteTimeGetCurrent() - t < 0.1 {
+                return true
+            }
+            keyCommandHandled.removeValue(forKey: code)
+            return false
+        }
+
+        private func forwardKey(_ key: UIKey, down: Bool) {
+            let code = Int(key.keyCode.rawValue)
+            if recentlyHandledByKeyCommand(code) { return }
+            if down { keysDown.insert(code) } else { keysDown.remove(code) }
+            // Don't send iPad characters — Mac input source owns layout.
+            receiver?.sendKey(code: code, down: down,
+                              mod: UInt(key.modifierFlags.rawValue),
+                              char: nil)
+        }
+
+        private func flushHeldKeys() {
+            guard !keysDown.isEmpty else { return }
+            keysDown.removeAll()
+            receiver?.sendKeysUp()
+        }
+
+        override func resignFirstResponder() -> Bool {
+            flushHeldKeys()
+            return super.resignFirstResponder()
+        }
+
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
             if !isFirstResponder { becomeFirstResponder() }
             routeTouches("began", touches, event, ended: false)
@@ -1119,12 +1292,11 @@ struct VideoLayerView: UIViewRepresentable {
         }
 
         override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-            guard let receiver else { super.pressesBegan(presses, with: event); return }
+            guard receiver != nil else { super.pressesBegan(presses, with: event); return }
             var handled = false
             for press in presses {
                 if let key = press.key {
-                    receiver.sendKey(code: Int(key.keyCode.rawValue), down: true,
-                                     mod: UInt(key.modifierFlags.rawValue), char: key.characters)
+                    forwardKey(key, down: true)
                     handled = true
                 }
             }
@@ -1132,12 +1304,11 @@ struct VideoLayerView: UIViewRepresentable {
         }
 
         override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-            guard let receiver else { super.pressesEnded(presses, with: event); return }
+            guard receiver != nil else { super.pressesEnded(presses, with: event); return }
             var handled = false
             for press in presses {
                 if let key = press.key {
-                    receiver.sendKey(code: Int(key.keyCode.rawValue), down: false,
-                                     mod: UInt(key.modifierFlags.rawValue), char: key.characters)
+                    forwardKey(key, down: false)
                     handled = true
                 }
             }
@@ -1145,13 +1316,14 @@ struct VideoLayerView: UIViewRepresentable {
         }
 
         override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-            guard let receiver else { super.pressesCancelled(presses, with: event); return }
+            guard receiver != nil else { super.pressesCancelled(presses, with: event); return }
             for press in presses {
                 if let key = press.key {
-                    receiver.sendKey(code: Int(key.keyCode.rawValue), down: false,
-                                     mod: UInt(key.modifierFlags.rawValue), char: key.characters)
+                    forwardKey(key, down: false)
                 }
             }
+            // Cancel can omit some keys from the set — flush anything left.
+            flushHeldKeys()
             super.pressesCancelled(presses, with: event)
         }
     }
@@ -1172,12 +1344,22 @@ final class InputCaptureEngine: NSObject {
     /// True while at least one pen contact is on the glass (palm rejection).
     var hasActivePen: Bool { !activePens.isEmpty }
 
+    /// True while the pencil hover recognizer is tracking (vs mouse/trackpad).
+    var isPencilHovering: Bool {
+        guard let hover = pencilHoverRecognizer else { return proximityActive }
+        switch hover.state {
+        case .began, .changed: return true
+        default: return proximityActive
+        }
+    }
+
     /// Map a point in the host view to normalized video coordinates.
     var normalize: ((CGPoint) -> (x: Double, y: Double)?)?
 
     private weak var hostView: UIView?
     private var activePens: Set<UInt64> = []
     private var proximityActive = false
+    private weak var pencilHoverRecognizer: UIHoverGestureRecognizer?
 
     func install(on view: UIView) {
         hostView = view
@@ -1186,6 +1368,7 @@ final class InputCaptureEngine: NSObject {
         let hover = UIHoverGestureRecognizer(target: self, action: #selector(hoverChanged(_:)))
         hover.allowedTouchTypes = [UITouch.TouchType.pencil.rawValue as NSNumber]
         view.addGestureRecognizer(hover)
+        pencilHoverRecognizer = hover
     }
 
     @objc private func hoverChanged(_ gr: UIHoverGestureRecognizer) {
