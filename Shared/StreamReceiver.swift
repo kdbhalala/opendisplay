@@ -821,8 +821,10 @@ final class StreamReceiver: ObservableObject {
     private func resetStreamState() {
         buffer.removeAll(keepingCapacity: true)
         formatDesc = nil
+        vps = nil
         sps = nil
         pps = nil
+        isHEVC = false   // the next sender decides the codec afresh
         lastFrameAt = nil
         frameIntervals.removeAll()
         decodeFlushes = 0
@@ -1062,27 +1064,48 @@ final class StreamReceiver: ObservableObject {
         var vclNALUs: [Data] = []
         for nalu in nalus {
             guard let first = nalu.first else { continue }
-            let hevcType = (first & 0x7E) >> 1
-            let h264Type = first & 0x1F
-
-            if hevcType == 32 { // HEVC VPS
+            // H.264 and HEVC read the NAL type from different bits of the
+            // same byte, and no codec tag crosses the wire (PROTOCOL.md
+            // 6.6) — the parameter sets themselves mark the codec, and a
+            // switch always opens with fresh parameter sets on a keyframe.
+            // The markers must be exact bytes, not shifted types: an H.264
+            // P-slice (0x41) shares its HEVC-type bits with a VPS, so
+            // matching on the type alone would flip an H.264 session into
+            // HEVC mode on its first delta frame. 0x40 can only be an HEVC
+            // VPS (H.264 never emits type 0), and 0x67/0x68 can only be an
+            // H.264 SPS/PPS (their HEVC-type bits land in the reserved
+            // range no HEVC encoder emits).
+            if first == 0x40, !isHEVC {
                 isHEVC = true
-                if vps != nalu { vps = nalu; formatDesc = nil }
-            } else if isHEVC && hevcType == 33 { // HEVC SPS
-                if sps != nalu { sps = nalu; formatDesc = nil }
-            } else if isHEVC && hevcType == 34 { // HEVC PPS
-                if pps != nalu { pps = nalu; formatDesc = nil }
-            } else if !isHEVC && h264Type == 7 { // H.264 SPS
-                if sps != nalu { sps = nalu; formatDesc = nil }
-            } else if !isHEVC && h264Type == 8 { // H.264 PPS
-                if pps != nalu { pps = nalu; formatDesc = nil }
-            } else if (isHEVC && (hevcType == 39 || hevcType == 40)) || (!isHEVC && h264Type == 6) {
-                // SEI — skip
+                vps = nil; sps = nil; pps = nil; formatDesc = nil
+            } else if first == 0x67 || first == 0x68, isHEVC {
+                isHEVC = false
+                vps = nil; sps = nil; pps = nil; formatDesc = nil
+            }
+            if isHEVC {
+                switch (first & 0x7E) >> 1 {
+                case 32: if vps != nalu { vps = nalu; formatDesc = nil }
+                case 33: if sps != nalu { sps = nalu; formatDesc = nil }
+                case 34: if pps != nalu { pps = nalu; formatDesc = nil }
+                case 0..<32: vclNALUs.append(nalu)   // VCL slice
+                // Every other non-VCL unit — AUD (35, the hardware encoder
+                // emits one per frame), EOS/EOB (36/37), filler (38), SEI
+                // (39/40) — must be dropped: fed to the decoder as slice
+                // data they corrupt every frame.
+                default: break
+                }
             } else {
-                vclNALUs.append(nalu)
+                switch first & 0x1F {
+                case 7: if sps != nalu { sps = nalu; formatDesc = nil }
+                case 8: if pps != nalu { pps = nalu; formatDesc = nil }
+                case 1...5: vclNALUs.append(nalu)    // VCL slice
+                default: break   // SEI (6), AUD (9), filler (12) — not slices
+                }
             }
         }
-        if formatDesc == nil, let sps, let pps {
+        // HEVC needs all three parameter sets; without the VPS the sps/pps
+        // pair must not reach the H.264 builder by accident.
+        if formatDesc == nil, let sps, let pps, !isHEVC || vps != nil {
             displayLayer.flush()   // drop any frames from the previous format
             buildFormatDescription(vps: vps, sps: sps, pps: pps)
         }
