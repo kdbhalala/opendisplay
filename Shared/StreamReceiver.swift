@@ -227,6 +227,11 @@ final class StreamReceiver: ObservableObject {
     // nothing about. nil = advertise nothing (sender streams full size).
     private let maxEncodeWide: Int?
     private let maxEncodeHigh: Int?
+    // Decode ceiling under HEVC (PROTOCOL.md 6.6). Setting these is also the
+    // opt-in for advertising HEVC in hello.codecs — a receiver that cannot
+    // hardware-decode HEVC must leave them nil so the sender never picks it.
+    private let hevcMaxEncodeWide: Int?
+    private let hevcMaxEncodeHigh: Int?
     /// What to advertise when the user-set service name is empty.
     private let fallbackServiceName: String
 
@@ -298,12 +303,15 @@ final class StreamReceiver: ObservableObject {
 
     init(displayLayer: AVSampleBufferDisplayLayer, deviceKind: String,
          fallbackServiceName: String,
-         maxEncodeWide: Int? = nil, maxEncodeHigh: Int? = nil) {
+         maxEncodeWide: Int? = nil, maxEncodeHigh: Int? = nil,
+         hevcMaxEncodeWide: Int? = nil, hevcMaxEncodeHigh: Int? = nil) {
         self.displayLayer = displayLayer
         self.deviceKind = deviceKind
         self.fallbackServiceName = fallbackServiceName
         self.maxEncodeWide = maxEncodeWide
         self.maxEncodeHigh = maxEncodeHigh
+        self.hevcMaxEncodeWide = hevcMaxEncodeWide
+        self.hevcMaxEncodeHigh = hevcMaxEncodeHigh
         displayLayer.videoGravity = .resizeAspect
     }
 
@@ -847,6 +855,14 @@ final class StreamReceiver: ObservableObject {
         if let maxEncodeWide, let maxEncodeHigh {
             hello["maxEncodeWide"] = maxEncodeWide
             hello["maxEncodeHigh"] = maxEncodeHigh
+        }
+        // Additive: codecs this receiver decodes beyond the implicit H.264,
+        // with the ceiling that applies under HEVC (PROTOCOL.md 6.6). H.264
+        // is listed too so the field reads as the full set, not a delta.
+        if let hevcMaxEncodeWide, let hevcMaxEncodeHigh {
+            hello["codecs"] = ["h264", "hevc"]
+            hello["hevcMaxEncodeWide"] = hevcMaxEncodeWide
+            hello["hevcMaxEncodeHigh"] = hevcMaxEncodeHigh
         }
         // Additive: the addresses this receiver can be reached on, so the
         // sender can probe for a better (cabled) path and migrate a WiFi

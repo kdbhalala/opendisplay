@@ -4,40 +4,37 @@ import CoreMedia
 
 final class HEVCEncodingTests: XCTestCase {
 
-    func testHEVCCompressionSessionCreation() {
+    private func makeSession(codec: CMVideoCodecType, width: Int32, height: Int32,
+                             lowLatency: Bool) -> (VTCompressionSession?, OSStatus) {
         var encoder: VTCompressionSession?
-        let spec: CFDictionary = [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: kCFBooleanTrue] as CFDictionary
-        var status = VTCompressionSessionCreate(
+        let spec: CFDictionary? = lowLatency
+            ? [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: kCFBooleanTrue] as CFDictionary
+            : nil
+        let status = VTCompressionSessionCreate(
             allocator: nil,
-            width: 1920,
-            height: 1080,
-            codecType: kCMVideoCodecType_HEVC,
+            width: width, height: height,
+            codecType: codec,
             encoderSpecification: spec,
             imageBufferAttributes: nil,
             compressedDataAllocator: nil,
             outputCallback: nil,
             refcon: nil,
-            compressionSessionOut: &encoder
-        )
+            compressionSessionOut: &encoder)
+        return (encoder, status)
+    }
 
-        // If hardware low latency is unsupported on specific GPU, fallback without spec
+    func testHEVCCompressionSessionCreation() throws {
+        // Same fallback ladder as the sender: low-latency spec first, plain
+        // session when no encoder offers the mode (#133).
+        var (encoder, _) = makeSession(codec: kCMVideoCodecType_HEVC,
+                                       width: 1920, height: 1080, lowLatency: true)
         if encoder == nil {
-            status = VTCompressionSessionCreate(
-                allocator: nil,
-                width: 1920,
-                height: 1080,
-                codecType: kCMVideoCodecType_HEVC,
-                encoderSpecification: nil,
-                imageBufferAttributes: nil,
-                compressedDataAllocator: nil,
-                outputCallback: nil,
-                refcon: nil,
-                compressionSessionOut: &encoder
-            )
+            (encoder, _) = makeSession(codec: kCMVideoCodecType_HEVC,
+                                       width: 1920, height: 1080, lowLatency: false)
         }
-
-        XCTAssertEqual(status, noErr)
-        XCTAssertNotNil(encoder)
+        // No HEVC encoder at all is a machine property, not a regression —
+        // the sender's negotiation stays on H.264 there.
+        try XCTSkipIf(encoder == nil, "this machine has no HEVC encoder")
 
         if let encoder {
             VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
@@ -50,24 +47,10 @@ final class HEVCEncodingTests: XCTestCase {
     }
 
     func testH264CompressionSessionCreation() {
-        var encoder: VTCompressionSession?
-        let status = VTCompressionSessionCreate(
-            allocator: nil,
-            width: 1280,
-            height: 720,
-            codecType: kCMVideoCodecType_H264,
-            encoderSpecification: nil,
-            imageBufferAttributes: nil,
-            compressedDataAllocator: nil,
-            outputCallback: nil,
-            refcon: nil,
-            compressionSessionOut: &encoder
-        )
+        let (encoder, status) = makeSession(codec: kCMVideoCodecType_H264,
+                                            width: 1280, height: 720, lowLatency: false)
         XCTAssertEqual(status, noErr)
         XCTAssertNotNil(encoder)
-
-        if let encoder {
-            VTCompressionSessionInvalidate(encoder)
-        }
+        if let encoder { VTCompressionSessionInvalidate(encoder) }
     }
 }
