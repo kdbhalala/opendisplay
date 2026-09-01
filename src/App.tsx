@@ -191,7 +191,7 @@ export default function App() {
             A true extended display, not a mirror: USB or WiFi, Retina-sharp, with touch and
             scroll. No subscription. No dongle. No account.
           </p>
-          <p className="meta">macOS 14+ &nbsp;·&nbsp; iPadOS 16+ &nbsp;·&nbsp; iOS 16+ &nbsp;·&nbsp; GPL-3.0</p>
+          <p className="meta">macOS 14+ &nbsp;·&nbsp; iPadOS 16+ &nbsp;·&nbsp; iOS 16+ &nbsp;·&nbsp; Receiver Mac 12+ &nbsp;·&nbsp; GPL-3.0</p>
         </div>
       </section>
 
@@ -228,6 +228,13 @@ export default function App() {
                   <p className="note">
                     Looking for an older version?{" "}
                     <a href="https://github.com/peetzweg/opendisplay/releases">Browse all releases ↗</a>
+                  </p>
+                  <p className="note">
+                    Got a spare <em>Mac</em> to use as the display? Install{" "}
+                    <a href="https://github.com/peetzweg/opendisplay/releases/latest/download/OpenDisplayReceiver.dmg">
+                      OpenDisplay Receiver
+                    </a>{" "}
+                    on it instead of the iOS app — runs on macOS&nbsp;12+, so older Macs qualify.
                   </p>
                 </div>
               )
@@ -335,6 +342,7 @@ export default function App() {
             <div className="fcell"><span className="n">007</span><h3>Touch &amp; scroll</h3><p>Tap to click, drag to drag, two-finger pan to scroll. A tiny touchscreen for your Mac.</p></div>
             <div className="fcell"><span className="n">008</span><h3>Portrait mode</h3><p>Rotate the phone and the virtual display rebuilds as a vertical monitor — perfect for chat, logs, or docs.</p></div>
             <div className="fcell"><span className="n">009</span><h3>Private by design</h3><p>One direct TCP connection between your devices. No servers, no accounts, no telemetry. Read the code.</p></div>
+            <div className="fcell"><span className="n">010</span><h3>A spare Mac as a display</h3><p>Install the small <em>OpenDisplay Receiver</em> app (macOS 12+) on an old Mac and another Mac extends onto it — a real Retina extended display, over WiFi or a Thunderbolt or Ethernet cable. An old MacBook becomes a second monitor.</p></div>
           </div>
         </div>
       </section>
@@ -426,6 +434,18 @@ export default function App() {
               <p>The receiver is a universal iOS app — it runs on iPad today. Run the Mac, an iPhone
               <em>and</em> an iPad at once for a second and a third screen. iPad-specific features
               (Apple Pencil, pressure) are on the roadmap.</p>
+            </details>
+            <details>
+              <summary>Can another Mac be the display?</summary>
+              <p>Yes. Install <em>OpenDisplay Receiver</em>, a separate small app from the same release, on
+              the spare Mac. It needs only macOS 12 Monterey or newer (the sending Mac needs 14), so Macs
+              from around 2015 onward qualify. It appears on the sending Mac like a phone would and
+              becomes a real extended Retina display. WiFi works out of the box. For a cable, use a
+              <em>Thunderbolt or USB4</em> cable (macOS sets up a Thunderbolt Bridge network between
+              the two), Ethernet, or — on recent macOS on both Macs — a plain USB-C data cable (approve
+              the "allow accessory" prompt on each Mac). The sender moves the session onto the cable
+              automatically, even one plugged in mid-session. Keyboard and mouse
+              input from the receiving Mac is a follow-up.</p>
             </details>
             <details>
               <summary>Is any of my screen data sent to a server?</summary>
